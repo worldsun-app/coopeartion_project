@@ -198,3 +198,10 @@ class NotionService:
         flat = self._list_children_recursive(page_id, depth=0)  # [(depth, block), ...]
         all_lines = self.extract_all_text_from_flat(flat)
         return "\n".join(all_lines).strip() or "（此頁未找到「客戶畫像」內容）"
+
+    def append_blocks_to_page(self, page_id: str, blocks: List[Dict[str, Any]]) -> None:
+        """將指定的 blocks 附加到頁面尾端"""
+        url = f"{BASE}/blocks/{page_id}/children"
+        payload = {"children": blocks}
+        r = requests.patch(url, headers=self._headers(), json=payload, timeout=30)
+        r.raise_for_status()
