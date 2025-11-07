@@ -58,12 +58,6 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(f"【{title}】\nQ: {question}\n\nA:\n{answer}\n\n（可輸入一般訊息繼續追問，或 /end 結束）")
             return
 
-    # 模式二：通用問答 (參數 < 2 或找不到客戶)
-    question = " ".join(args)
-    await update.message.reply_text(f"正在為您查詢「{question}」，請稍候...")
-    answer = await answer_with_grounding(question)
-    await update.message.reply_text(answer)
-
 async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     if chat_id not in CONV:
@@ -133,8 +127,8 @@ async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if history[i]["role"] == "assistant":
             last_assistant_index = i
             break
-    recent_discussions = history[last_assistant_index + 1:]
-    discussion_texts = [msg["content"] for msg in recent_discussions if msg["role"] == "discussion"]
+    recent_discussions = history[last_assistant_index:]
+    discussion_texts = [msg["content"] for msg in recent_discussions if msg["role"] == "discussion" or msg["role"] == "assistant"]
     # 組合 prompt
     prompt_context = ""
     if discussion_texts:

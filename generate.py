@@ -15,15 +15,17 @@ except Exception as e:
 def _build_user_prompt(title: str, portrait: str, question: str) -> str:
     """建立用於問答的提示"""
     return (
+        f"您好，您是公司內部成員的助理，正在協助團隊針對客戶進行客觀分析與討論。"
+        f"請根據以下客戶畫像（特別是客戶的人格特質、著重事項及目前資金配置），以客觀公正的立場，簡潔地回答以下問題。"
+        f"無須前言以及後述。\n\n"
         f"客戶名稱：{title}\n"
         f"客戶畫像（節錄）：\n{portrait}\n\n"
-        f"任務：請根據以上畫像與問題，產出回答。\n"
         f"問題：{question}\n"
-        f"輸出格式：\n"
-        f"1) 人格特質：\n"
-        f"2) 客戶著重事項：\n"
-        f"3) 目前資金配置：\n"
-        f"4) {question} 回覆：\n"
+        f"輸出格式："
+        f"1) 人格特質：[簡述客戶的人格特質]"
+        f"2) 客戶著重事項：[簡述客戶目前最著重的事項]"
+        f"3) 目前資金配置：[簡述客戶目前的資金配置狀況]"
+        f"4) {question} 回覆：[針對問題的簡短客觀回答]"
     )
 
 async def answer_question(title: str, portrait: str, question: str) -> str:
@@ -82,6 +84,7 @@ async def answer_with_grounding(question: str) -> str:
     """
     使用 Google 搜尋作為 grounding tool 來回答問題。
     """
+    print(question)
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
