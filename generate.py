@@ -20,8 +20,10 @@ def _build_user_prompt(title: str, portrait: str, question: str) -> str:
         f"任務：請根據以上畫像與問題，產出回答。\n"
         f"問題：{question}\n"
         f"輸出格式：\n"
-        f"1) 重點摘要（3-6 點）\n"
-        f"2) 具體建議（可操作）\n"
+        f"1) 人格特質：\n"
+        f"2) 客戶著重事項：\n"
+        f"3) 目前資金配置：\n"
+        f"4) {question} 回覆：\n"
     )
 
 async def answer_question(title: str, portrait: str, question: str) -> str:
@@ -40,9 +42,6 @@ async def answer_question(title: str, portrait: str, question: str) -> str:
 
 async def summarize_conversation(title: str, history: List[Dict[str, str]]) -> str:
     """呼叫 Gemini API 產生對話摘要"""
-    if not client:
-        return "Gemini API 金鑰未設定，無法呼叫語言模型。"
-
     # 為不同角色設定更清晰的標籤
     role_map = {
         "user": "提問者",
