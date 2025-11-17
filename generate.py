@@ -22,7 +22,7 @@ def _build_user_prompt(title: str, portrait: str, question: str) -> str:
         f"客戶畫像（節錄）：\n{portrait}\n\n"
         f"問題：{question}\n"
         f"輸出格式："
-        f"1) 人格特質：[簡述客戶的人格特質]"
+        f"1) 人格特質、個性：[簡述客戶的人格特質]"
         f"2) 客戶著重事項：[簡述客戶目前最著重的事項]"
         f"3) 目前資金配置：[簡述客戶目前的資金配置狀況]"
         f"4) {question} 回覆：[針對問題的簡短客觀回答]"

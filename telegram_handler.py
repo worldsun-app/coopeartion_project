@@ -156,4 +156,3 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "role": "discussion",
         "content": f"{user.full_name}: {message_text}"
     })
-    # 不對討論內容做任何回覆
