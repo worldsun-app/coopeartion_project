@@ -3,9 +3,11 @@ import os
 from typing import Dict, Any, List
 from telegram import Update
 from telegram.ext import ContextTypes, Application
+import gcp_service
 from notion_service import NotionService
 from gcp_service import GcpService
-from generate import answer_question, summarize_conversation, answer_with_grounding, summarize_segment
+from generate import answer_question, summarize_conversation, answer_with_grounding, summarize_segment, extract_product_from_query, extract_keywords_from_query
+
 
 # 以簡單的 in-memory 狀態記錄對話（可換成 Redis/DB）
 CONV: Dict[int, Dict[str, Any]] = {}
@@ -27,6 +29,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- `/query [問題]`: 根據當前討論向 AI 提問。\n"
         "- `/products [問題]`: 根據當前討論搜尋產品資料庫。\n"
         "- `/end`: 結束目前對話，並將討論摘要寫入 Notion。\n\n"
+        "獨立指令：\n"
+        "- `/search_db [你的問題]`: 直接查詢公司產品資料庫，可包含產品名稱以聚焦搜尋。\n"
         "您也可以隨時輸入 `/start` 來查看此說明。"
     )
 
@@ -219,7 +223,10 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state = CONV[chat_id]
     history = state["history"]
 
-    # 1. 找出最近的對話片段作為上下文
+    # 智慧篩選：從問題中提取產品名稱
+    product_filter = await extract_product_from_query(user_query)
+
+    # 找出最近的對話片段作為上下文
     last_assistant_index = -1
     for i in range(len(history) - 1, -1, -1):
         if history[i]["role"] == "assistant":
@@ -234,15 +241,25 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         discussion_summary = "\n".join(discussion_texts)
         context_for_search = f"請參考以下團隊成員的討論摘要：\n---\n{discussion_summary}\n---\n"
 
-    full_query = f"{context_for_search}根據上述討論，請到公司產品資料庫中搜尋並回答：{user_query}"
+    base_query = f"{context_for_search}根據上述討論，請到公司產品資料庫中搜尋並回答：{user_query}"
+    
+    # 如果提取到產品名稱，則重組查詢
+    if product_filter:
+        final_query = f'("{product_filter}") AND ({base_query})'
+        await update.message.reply_text(f"好的，正在為您聚焦搜尋「{product_filter}」的相關資料...")
+    else:
+        final_query = base_query
+        await update.message.reply_text("正在參考討論內容，到公司產品資料庫搜尋，請稍候...")
 
-    # 2. 產生並回覆答案
-    await update.message.reply_text("正在參考討論內容，到公司產品資料庫搜尋，請稍候...")
     gcp_service: GcpService = context.application.bot_data["gcp"]
-    answer = gcp_service.query_knowledge_base(full_query)
+    answer = gcp_service.query_knowledge_base(
+        user_question=user_query,      # 使用者原始案例
+        product_filter=product_filter, # 若你有從 /products 的問題再抽產品名
+        search_query=final_query,      # 你組出來的強化版查詢
+    )
     await update.message.reply_text(answer)
 
-    # 3. 在背景進行滾動式摘要
+    # 在背景進行滾動式摘要
     segment_to_summarize = (history[last_assistant_index:] if last_assistant_index != -1 else history).copy()
     segment_to_summarize.append({"role": "user", "content": f"/products {user_query}"})
     segment_to_summarize.append({"role": "assistant", "content": answer})
@@ -274,3 +291,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """處理機器人無法識別的指令"""
     await update.message.reply_text("抱歉，我無法識別這個指令。請確認您的輸入是否正確。 সন")
+
+async def direct_database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """獨立查詢公司產品資料庫，不影響對話歷史"""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("請輸入您要查詢產品資料庫的問題：/search_db [你的問題]")
+        return
+    user_query = " ".join(args)
+    # 步驟 1: 提取產品名稱
+    product_filter = await extract_product_from_query(user_query)
+    # 步驟 2: 提取關鍵字
+    keywords = await extract_keywords_from_query(user_query)
+    final_query = ""
+    # 步驟 3: 根據提取結果建立查詢
+    if keywords:
+        keyword_query_part = " OR ".join([f'"{k}"' for k in keywords])
+        keyword_query = f"({keyword_query_part})"
+        
+        if product_filter:
+            final_query = f'("{product_filter}") AND {keyword_query}'
+            await update.message.reply_text(f"好的，正在為您在「{product_filter}」中搜尋：{user_query}...")
+        else:
+            final_query = keyword_query
+            await update.message.reply_text(f"好的，正在為您搜尋：{user_query}...")
+    else:
+        if product_filter:
+            final_query = f'("{product_filter}") AND ("{user_query}")'
+            await update.message.reply_text(f"無法提取有效關鍵字，正在嘗試在「{product_filter}」中搜尋您的原文...")
+        else:
+            final_query = user_query
+            await update.message.reply_text("無法提取有效關鍵字，正在嘗試直接搜尋您的原文...")
+
+    gcp_service: GcpService = context.application.bot_data["gcp"]
+    answer = gcp_service.query_knowledge_base(
+        user_question=user_query,       # 直接用使用者原始敘述
+        product_filter=product_filter,
+        search_query=final_query,       # 這個是你為 Search 組好的關鍵字
+    )
+    await update.message.reply_text(answer)

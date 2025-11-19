@@ -38,7 +38,7 @@ class GcpService:
         )
         return client, serving_config
 
-    def _search_segments(self, user_question, max_results=5, top_segments=12):
+    def _search_segments(self, user_question, product_filter: str = None, max_results=5, top_segments=12):
         """
         用 Vertex AI Search 取得與問題最相關的段落（extractive segments），
         回傳一個 list，每個元素包含 text / source_title / page。
@@ -75,10 +75,13 @@ class GcpService:
                 )
             ),
         )
+        search_query = user_question
+        if product_filter:
+            search_query = f"{user_question} {product_filter}"
 
         request = discoveryengine.SearchRequest(
             serving_config=self.serving_config,
-            query=user_question,
+            query=search_query,
             page_size=max_results,
             content_search_spec=content_search_spec,
         )
@@ -145,89 +148,92 @@ class GcpService:
         print(f"\nDEBUG: collected segments = {len(segments_info)}, selected = {len(selected_segments)}")
         return segments_info, getattr(response, "summary", None)
 
-    def _generate_with_gemini(self, user_question, segments, summary_obj=None):
+    def _generate_with_gemini(self, user_question, segments, summary_obj=None, product_filter: str = None):
         """
         使用『Google Gen AI SDK』呼叫 Vertex 上的 Gemini，
-        取代舊的 vertexai.generative_models 寫法。
+        並採用嚴格的提示工程以避免資訊污染。
         """
-        # 1) 加上 cloud-platform scope，這是官方建議的做法
         scoped_credentials = self.credentials.with_scopes(
             ["https://www.googleapis.com/auth/cloud-platform"]
         )
-
-        # 2) 建立 Google Gen AI 的 client，後端指定走 Vertex AI
         client = genai.Client(
             vertexai=True,
             project=self.project_id,
-            location="us-central1",   # 你 Gemini 用的 region，照你專案調整
+            location="us-central1",
             credentials=scoped_credentials,
             http_options=genai_types.HttpOptions(api_version="v1"),
         )
 
-        # 3) 把 Search 找到的段落組成 context
         if not segments and summary_obj and getattr(summary_obj, "summary_text", None):
-            # 沒 segment，退而求其次用 Search 的 summary
             context_text = summary_obj.summary_text
             sources_index = "（本次僅使用摘要內容，未提供逐頁來源。）"
         else:
-            context_parts = []
-            sources_index_lines = []
+            context_parts = [
+                f"來源文件：{seg.get('source_title', '未命名')}\n頁碼：{seg.get('page', '未知')}\n內容：\n{seg.get('text')}"
+                for seg in segments
+            ]
+            context_text = "\n\n---\n\n".join(context_parts)
 
-            for idx, seg in enumerate(segments, start=1):
-                title = seg.get("source_title") or "未命名文件"
-                page = seg.get("page")
-                page_str = f"在{title} 的第 {page} 頁附近" if page is not None else "頁碼未知"
+        # 根據是否有 product_filter，動態產生 prompt
+        if product_filter:
+            # 高度鎖定產品的 prompt
+            prompt = f"""
+                你是一位只了解「{product_filter}」這份保單的專家。
+                請嚴格、且只能使用下方提供的「{product_filter}」資料片段來回答客戶問題。
 
-                # 給模型看的「來源標頭＋內容」
-                context_parts.append(
-                    f"檔名：{title}；頁碼：{page_str}\n{seg.get('text')}"
-                )
+                你的回答中，每一句話都必須有來源根據，並在句末以括號標明出處，格式為 ({product_filter} 产品手册, 第XX頁)。
+                如果提供的資料片段不足以回答問題，你必須直接回答：「根據提供的「{product_filter}」資料，無法找到相關資訊。」
+                絕對不允許使用任何非提供資料之外的知識或進行任何推斷。
 
-                # 再額外做一份清楚的索引表，方便它在答案中引用
-                sources_index_lines.append(f"{title}，{page_str}")
+                --- 「{product_filter}」資料片段 ---
+                {context_text}
+                ---
 
-            context_text = "\n\n".join(context_parts)
-            sources_index = "\n".join(sources_index_lines)
+                【客戶問題】
+                {user_question}
 
-        prompt = f"""
-            你是壽險與家族傳承規劃顧問，熟悉分紅壽險、保障結構設計與後備持有人 / 被保人安排。
-            以下是從保險公司產品手冊與相關文件中擷取出來的段落（可能來自不同商品）：
-            【資料來源片段】
-            {context_text}
+                請開始回答：
+            """
+        else:
+            # 通用但依然嚴格的 prompt
+            prompt = f"""
+                你是一位專業的保險顧問。請根據下方提供的資料片段來回答客戶問題。
+                警告：資料來源可能來自不同的產品文件，回答時請務必清晰地指明每個資訊點來自哪個文件。
 
-            【來源索引表】
-            以下是各來源編號對應的檔名與大約頁碼：
-            {sources_index}
+                你的回答中，每一句話都必須有來源根據，並在句末以括號標明出處，格式為 (產品名稱, 第XX頁)。
+                如果提供的資料片段不足以回答問題，你必須直接回答：「根據提供的資料，無法找到相關資訊。」
+                絕對不允許使用任何非提供資料之外的知識。
 
-            下面是客戶的實際情境與需求：
-            【客戶問題】
-            {user_question}
-            請你根據上述「資料來源片段」中的內容，並搭配一般合理的壽險與家族傳承規劃原則，回覆最適合客戶問題的建議方案，供內部討論草案使用。
-            
-            回答時請務必引用「來源索引表」中的檔名與頁碼，說明你的建議來自哪些文件與位置。
-            禁止任何前言、問候、自我介紹、後序等贅述，直接切入重點回答客戶問題。
-            回答使用一般文字格式，不要使用任何標記語言（例如 Markdown）、也不使用任何標記符號 (例如 *、#)。
-        """
+                --- 資料片段 ---
+                {context_text}
+                ---
+
+                【客戶問題】
+                {user_question}
+
+                請開始回答：
+            """
+
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
         )
         return response.text
 
-    def query_knowledge_base(self, user_question: str) -> str:
+    def query_knowledge_base(self, user_question: str, product_filter: str | None = None, search_query: str | None = None) -> str:
         print(f"INFO: 開始使用 Vertex AI Search + Gemini 查詢，問題: {user_question}")
+        search_text = search_query or user_question
 
         try:
             # 3) 先用 Search 找出相關段落
             segments, summary_obj = self._search_segments(
-                user_question, max_results=5, top_segments=12
+                search_text, product_filter=product_filter, max_results=5, top_segments=12
             )
             if not segments and not (summary_obj and summary_obj.summary_text):
                 print("WARN: 找不到任何相關段落或摘要。")
                 return "根據目前索引到的文件，找不到與此問題足夠相關的內容，請確認資料庫或換個問法。"
             # 4) 再用 Gemini 產生最終規劃建議
-            answer = self._generate_with_gemini(user_question, segments, summary_obj)
-            print("INFO: 查詢與回答已完成。")
+            answer = self._generate_with_gemini(user_question, segments, summary_obj, product_filter=product_filter)
             return answer
 
         except Exception as e:

@@ -143,3 +143,60 @@ async def answer_with_grounding(question: str):
         return response.text
     except Exception as e:
         return f"使用 grounding tool 查詢時發生錯誤：{e}"
+
+async def extract_product_from_query(query: str) -> str:
+    """從使用者問題中提取產品名稱"""
+    prompt = (
+        f"任務：從以下「使用者問題」中，僅提取出保險產品或公司的完整名稱。\n"
+        f"規則：\n"
+        f"1. 產品或公司名稱通常會出現在「在...當中」、「關於...」這類詞語的後面。\n"
+        f"2. 只回傳名稱本身，不要包含任何多餘的文字、引號或解釋。\n"
+        f"3. 如果沒有提到任何具體的產品或公司名稱，請回傳一個空字串。\n\n"
+        f"--- 使用者問題 ---\n"
+        f"{query}\n"
+        f"--- 結束 ---\n\n"
+        f"產品或公司名稱："
+    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        # 清理輸出，移除多餘的引號或換行
+        product_name = response.text.strip().strip('"').strip("'")
+        print(f"DEBUG: Extracted product name: '{product_name}'")
+        return product_name
+    except Exception as e:
+                print(f"從查詢中提取產品名稱時發生錯誤：{e}")
+                return ""
+        
+async def extract_keywords_from_query(query: str) -> List[str]:
+    """從使用者問題中提取關鍵字列表"""
+    prompt = (
+        f"任務：從以下「使用者問題」中，提取出與保險相關的核心關鍵字。\n"
+        f"規則：\n"
+        f"1. 關鍵字應包含：角色（如：要保人、被保人、受益人、後備持有人）、事件（如：過世、繼承、變更、理賠）、概念（如：直系親屬、豁免保費）等。\n"
+        f"2. 只回傳以逗號分隔的關鍵字列表，不要有任何多餘的文字、引號或解釋。\n"
+        f"3. 如果問題很模糊或沒有可識別的關鍵字，請回傳一個空字串。\n\n"
+        f"--- 使用者問題 ---\n"
+        f"{query}\n"
+        f"--- 結束 ---\n\n"
+        f"關鍵字列表："
+    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        keywords_str = response.text.strip()
+        if not keywords_str:
+            return []
+        
+        # 以逗號分隔，並清理每個關鍵字多餘的空格
+        keywords = [k.strip() for k in keywords_str.split(',')]
+        print(f"DEBUG: Extracted keywords: {keywords}")
+        return keywords
+    except Exception as e:
+        print(f"從查詢中提取關鍵字時發生錯誤：{e}")
+        return []
+        
