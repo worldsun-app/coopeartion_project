@@ -27,6 +27,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "在載入客戶資料後，您可以使用以下指令：\n"
         "- `/query [問題]`: 根據當前討論向 AI 提問。\n"
         "- `/products [問題]`: 根據當前討論搜尋產品資料庫。\n"
+        "- `/cancel`: 結束目前對話，並停止對話不進行摘要寫入。\n"
         "- `/end`: 結束目前對話，並將討論摘要寫入 Notion。\n\n"
         "獨立指令：\n"
         "- `/search_db [你的問題]`: 直接查詢公司產品資料庫，可包含產品名稱以聚焦搜尋。\n"
@@ -159,6 +160,16 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"寫入 Notion 時發生錯誤：{e}")
     finally:
         del CONV[chat_id]
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """處理 /cancel 指令，取消目前對話而不寫入 Notion"""
+    chat_id = update.message.chat_id
+    if chat_id not in CONV:
+        await update.message.reply_text("目前沒有進行中的會談。")
+        return
+
+    del CONV[chat_id]
+    await update.message.reply_text("已取消目前的會談。")
 
 async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """處理 /query 指令，結合討論內容進行提問，並在事後進行摘要"""

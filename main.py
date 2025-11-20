@@ -3,7 +3,7 @@ import logging
 from dotenv import load_dotenv
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from telegram_handler import start, ask_command, end_command, query_command, database_command, handle_message, inject_services, unknown_command, direct_database_command
+from telegram_handler import start, ask_command, end_command, cancel_command, query_command, database_command, handle_message, inject_services, unknown_command, direct_database_command
 from notion_service import NotionService
 from gcp_service import GcpService
 
@@ -52,6 +52,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("end", end_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("query", query_command))
     application.add_handler(CommandHandler("products", database_command))
     application.add_handler(CommandHandler("search_db", direct_database_command))
