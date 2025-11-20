@@ -8,7 +8,6 @@ load_dotenv()
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 GEMINI_LOCATION = os.getenv("GEMINI_LOCATION", "us-central1")
 
-# 初始化 Gemini 客戶端
 try:
     client = genai.Client(vertexai=True,
                         project=PROJECT_ID,
@@ -53,7 +52,6 @@ async def answer_question(title: str, portrait: str, question: str) -> str:
 
 async def summarize_conversation(title: str, history: List[Dict[str, str]]) -> str:
     """呼叫 Gemini API 產生對話摘要"""
-    # 為不同角色設定更清晰的標籤
     role_map = {
         "user": "提問者",
         "assistant": "機器人",
@@ -191,8 +189,7 @@ async def extract_keywords_from_query(query: str) -> List[str]:
         keywords_str = response.text.strip()
         if not keywords_str:
             return []
-        
-        # 以逗號分隔，並清理每個關鍵字多餘的空格
+
         keywords = [k.strip() for k in keywords_str.split(',')]
         print(f"DEBUG: Extracted keywords: {keywords}")
         return keywords

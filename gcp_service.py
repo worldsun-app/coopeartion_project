@@ -102,32 +102,25 @@ class GcpService:
             # print(f"=== Result {i} derived_struct_data ===")
             # print(derived_data)
 
-            # 1) 優先用 derived_struct_data 裡的 title
             raw_title = (
                 derived_data.get("title")
                 or derived_data.get("document_title")
             )
 
-            # 2) 再從 link 解析出檔名（例如 忠意啟航創富 產品手冊）
             link = derived_data.get("link")
             filename_title = None
             if link:
-                # link 可能是 "gs://bucket/忠意啟航創富 產品手冊.pdf"
-                # 先拿最後一段，再去掉副檔名
                 path_part = link
                 if link.startswith("gs://"):
-                    # gs://bucket_name/path/to/file.pdf → 取 path/to/file.pdf
                     path_part = link.split("/", 1)[-1]
                 filename = os.path.basename(path_part)
-                filename_title = os.path.splitext(filename)[0]  # 去掉 .pdf
+                filename_title = os.path.splitext(filename)[0]
 
-            # 3) 決定最後要用哪一個顯示名稱
             if raw_title and filename_title:
                 title = f"{filename_title}（{raw_title}）"
             else:
                 title = raw_title or filename_title or "未命名文件"
 
-            # 4) 取 extractive segments（注意 derived_struct_data 也是一個 Struct，要用 dict 後再拿）
             segments = derived_data.get("extractive_segments", [])
             for seg in segments:
                 text = seg.get("content", "")
@@ -153,7 +146,6 @@ class GcpService:
     def _generate_with_gemini(self, user_question, segments, summary_obj=None, product_filter: str = None, extra_context: str = None):
         """
         使用『Google Gen AI SDK』呼叫 Vertex 上的 Gemini。
-        
         Args:
             user_question: 使用者的原始問題
             segments: 搜尋到的文件段落
@@ -181,9 +173,6 @@ class GcpService:
             ]
             context_text = "\n\n---\n\n".join(context_parts)
 
-        # 構建 Prompt
-        # 如果有 extra_context (通常包含客戶資料或討論摘要)，我們要允許模型進行「推薦」
-        
         base_instruction = """
             你是一位專業的保險顧問。
             你的任務是根據提供的「產品資料片段」來回答客戶問題。
@@ -238,37 +227,20 @@ class GcpService:
         search_text = search_query or user_question
 
         try:
-            # 3) 先用 Search 找出相關段落
-            # 注意：這裡我們用 search_text (包含 context) 去做搜尋，這樣比較容易搜到跟 context 相關的關鍵字
             segments, summary_obj = self._search_segments(
                 search_text, product_filter=product_filter, max_results=5, top_segments=12
             )
-            
-            # 如果搜尋不到，但我們有 context，有時候還是可以嘗試回答 (例如只是閒聊)，
-            # 但這裡是產品資料庫，如果沒搜到產品資料，通常就無法推薦。
-            # 不過為了保險起見，如果完全沒 segments，還是回傳找不到。
+
             if not segments and not (summary_obj and summary_obj.summary_text):
                 print("WARN: 找不到任何相關段落或摘要。")
                 return "根據目前索引到的文件，找不到與此問題足夠相關的內容，請確認資料庫或換個問法。"
-
-            # 4) 再用 Gemini 產生最終規劃建議
-            # 這裡我們把 search_query 當作 extra_context 傳進去，
-            # 因為 search_query 通常長這樣： "請參考...討論... \n 搜尋並回答: {user_question}"
-            # 雖然有點重複，但讓 LLM 清楚知道這是背景資訊是有幫助的。
-            # 為了更乾淨，我們可以嘗試只把 user_question 以外的部分當 context，
-            # 但簡單起見，直接傳 search_query 讓 prompt 裡的 extra_context 處理 (雖然 prompt 裡我是分開欄位的)
-            # 修正：search_query 包含了 context + question。
-            # 為了避免 prompt 重複太多，我們可以把 search_query 當作 context 傳入，
-            # 或者在 telegram_handler 裡就分開傳。
-            # 鑑於介面限制，這裡我們直接把 search_query 視為 "包含 Context 的完整查詢字串"，
-            # 但為了 Prompt 結構漂亮，我們把它傳給 extra_context 參數。
             
             answer = self._generate_with_gemini(
                 user_question=user_question, 
                 segments=segments, 
                 summary_obj=summary_obj, 
                 product_filter=product_filter,
-                extra_context=search_query # 將完整的搜尋字串(含context)作為背景資訊給 LLM 參考
+                extra_context=search_query
             )
             return answer
 

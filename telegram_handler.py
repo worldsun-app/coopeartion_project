@@ -37,11 +37,21 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = update.message.chat_id
     args = context.args or []
 
+    # --- 新增的保護邏輯 ---
+    if chat_id in CONV:
+        current_customer = CONV[chat_id].get("customer_title", "目前的")
+        await update.message.reply_text(
+            f"您目前正在與「{current_customer}」的會談中。\n"
+            "請先使用 /end 指令結束目前的會談，才能開啟新的客戶資料。"
+        )
+        return
+    # --- 保護邏輯結束 ---
+
     if not args:
         await update.message.reply_text("指令用法：\n- /ask [客戶名稱] [問題]\n- /ask [客戶名稱]")
         return
 
-    # --- 新邏輯開始 ---
+    # --- 原有邏輯不變 ---
     customer_name = args[0]
     notion: NotionService = context.application.bot_data["notion"]
     
@@ -114,7 +124,6 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     history = state["history"]
     summary_text = await summarize_conversation(title, history)
 
-    # 將 summary_text 按照 Notion 的 2000 字元限制進行切割
     char_limit = 2000
     summary_chunks = [summary_text[i:i+char_limit] for i in range(0, len(summary_text), char_limit)]
 
@@ -127,8 +136,7 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             }
         }
     ]
-        
-    # 為每一個切割後的文字塊建立一個 paragraph block
+
     for chunk in summary_chunks:
         blocks_to_append.append({
             "object": "block",
