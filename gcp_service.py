@@ -95,7 +95,6 @@ class GcpService:
         for i, result in enumerate(response.results, start=1):
             doc = result.document
 
-            # 有些欄位會出現在 struct_data，有些在 derived_struct_data
             derived_data = dict(doc.derived_struct_data) if doc.derived_struct_data else {}
             # print(f"=== Result {i} derived_struct_data ===")
             # print(derived_data)
@@ -148,10 +147,16 @@ class GcpService:
         print(f"\nDEBUG: collected segments = {len(segments_info)}, selected = {len(selected_segments)}")
         return segments_info, getattr(response, "summary", None)
 
-    def _generate_with_gemini(self, user_question, segments, summary_obj=None, product_filter: str = None):
+    def _generate_with_gemini(self, user_question, segments, summary_obj=None, product_filter: str = None, extra_context: str = None):
         """
-        使用『Google Gen AI SDK』呼叫 Vertex 上的 Gemini，
-        並採用嚴格的提示工程以避免資訊污染。
+        使用『Google Gen AI SDK』呼叫 Vertex 上的 Gemini。
+        
+        Args:
+            user_question: 使用者的原始問題
+            segments: 搜尋到的文件段落
+            summary_obj: 搜尋結果的摘要物件 (可選)
+            product_filter: 產品過濾器 (可選)
+            extra_context: 額外的上下文資訊 (例如客戶資料、對話歷史)，通常來自 search_query 的前半部
         """
         scoped_credentials = self.credentials.with_scopes(
             ["https://www.googleapis.com/auth/cloud-platform"]
@@ -166,7 +171,6 @@ class GcpService:
 
         if not segments and summary_obj and getattr(summary_obj, "summary_text", None):
             context_text = summary_obj.summary_text
-            sources_index = "（本次僅使用摘要內容，未提供逐頁來源。）"
         else:
             context_parts = [
                 f"來源文件：{seg.get('source_title', '未命名')}\n頁碼：{seg.get('page', '未知')}\n內容：\n{seg.get('text')}"
@@ -174,45 +178,49 @@ class GcpService:
             ]
             context_text = "\n\n---\n\n".join(context_parts)
 
-        # 根據是否有 product_filter，動態產生 prompt
+        # 構建 Prompt
+        # 如果有 extra_context (通常包含客戶資料或討論摘要)，我們要允許模型進行「推薦」
+        
+        base_instruction = """
+            你是一位專業的保險顧問。
+            你的任務是根據提供的「產品資料片段」來回答客戶問題。
+        """
+        
+        if extra_context:
+            base_instruction += f"""
+            
+            【參考資訊】
+            以下是客戶的背景資料或團隊討論摘要，請參考這些資訊來判斷適合的產品：
+            ---
+            {extra_context}
+            ---
+            
+            請根據【參考資訊】中的客戶需求，從下方的【產品資料片段】中挑選最合適的產品或條款進行推薦與說明。
+            """
+        
+        base_instruction += """
+            【回答規則】
+            1. 當你引用【產品資料片段】中的具體條款、數據或產品特色時，必須在句末標註出處，格式為 (產品名稱, 第XX頁)。
+            2. 如果是根據【參考資訊】進行的邏輯推演或建議（例如：「因為客戶有XX需求，所以建議...」），則不需要標註產品出處，但必須說明理由。
+            3. 如果【產品資料片段】中完全沒有相關資訊可以支持你的回答或建議，請誠實告知：「根據目前的產品資料庫，無法找到合適的產品資訊。」
+            4. 嚴禁捏造產品內容。
+        """
+
         if product_filter:
-            # 高度鎖定產品的 prompt
-            prompt = f"""
-                你是一位只了解「{product_filter}」這份保單的專家。
-                請嚴格、且只能使用下方提供的「{product_filter}」資料片段來回答客戶問題。
+            base_instruction += f"\n注意：你目前被限制只能討論「{product_filter}」相關的內容。"
 
-                你的回答中，每一句話都必須有來源根據，並在句末以括號標明出處，格式為 ({product_filter} 产品手册, 第XX頁)。
-                如果提供的資料片段不足以回答問題，你必須直接回答：「根據提供的「{product_filter}」資料，無法找到相關資訊。」
-                絕對不允許使用任何非提供資料之外的知識或進行任何推斷。
+        prompt = f"""
+            {base_instruction}
 
-                --- 「{product_filter}」資料片段 ---
-                {context_text}
-                ---
+            --- 【產品資料片段】 ---
+            {context_text}
+            ---
 
-                【客戶問題】
-                {user_question}
+            【客戶問題】
+            {user_question}
 
-                請開始回答：
-            """
-        else:
-            # 通用但依然嚴格的 prompt
-            prompt = f"""
-                你是一位專業的保險顧問。請根據下方提供的資料片段來回答客戶問題。
-                警告：資料來源可能來自不同的產品文件，回答時請務必清晰地指明每個資訊點來自哪個文件。
-
-                你的回答中，每一句話都必須有來源根據，並在句末以括號標明出處，格式為 (產品名稱, 第XX頁)。
-                如果提供的資料片段不足以回答問題，你必須直接回答：「根據提供的資料，無法找到相關資訊。」
-                絕對不允許使用任何非提供資料之外的知識。
-
-                --- 資料片段 ---
-                {context_text}
-                ---
-
-                【客戶問題】
-                {user_question}
-
-                請開始回答：
-            """
+            請開始回答：
+        """
 
         response = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -226,14 +234,37 @@ class GcpService:
 
         try:
             # 3) 先用 Search 找出相關段落
+            # 注意：這裡我們用 search_text (包含 context) 去做搜尋，這樣比較容易搜到跟 context 相關的關鍵字
             segments, summary_obj = self._search_segments(
                 search_text, product_filter=product_filter, max_results=5, top_segments=12
             )
+            
+            # 如果搜尋不到，但我們有 context，有時候還是可以嘗試回答 (例如只是閒聊)，
+            # 但這裡是產品資料庫，如果沒搜到產品資料，通常就無法推薦。
+            # 不過為了保險起見，如果完全沒 segments，還是回傳找不到。
             if not segments and not (summary_obj and summary_obj.summary_text):
                 print("WARN: 找不到任何相關段落或摘要。")
                 return "根據目前索引到的文件，找不到與此問題足夠相關的內容，請確認資料庫或換個問法。"
+
             # 4) 再用 Gemini 產生最終規劃建議
-            answer = self._generate_with_gemini(user_question, segments, summary_obj, product_filter=product_filter)
+            # 這裡我們把 search_query 當作 extra_context 傳進去，
+            # 因為 search_query 通常長這樣： "請參考...討論... \n 搜尋並回答: {user_question}"
+            # 雖然有點重複，但讓 LLM 清楚知道這是背景資訊是有幫助的。
+            # 為了更乾淨，我們可以嘗試只把 user_question 以外的部分當 context，
+            # 但簡單起見，直接傳 search_query 讓 prompt 裡的 extra_context 處理 (雖然 prompt 裡我是分開欄位的)
+            # 修正：search_query 包含了 context + question。
+            # 為了避免 prompt 重複太多，我們可以把 search_query 當作 context 傳入，
+            # 或者在 telegram_handler 裡就分開傳。
+            # 鑑於介面限制，這裡我們直接把 search_query 視為 "包含 Context 的完整查詢字串"，
+            # 但為了 Prompt 結構漂亮，我們把它傳給 extra_context 參數。
+            
+            answer = self._generate_with_gemini(
+                user_question=user_question, 
+                segments=segments, 
+                summary_obj=summary_obj, 
+                product_filter=product_filter,
+                extra_context=search_query # 將完整的搜尋字串(含context)作為背景資訊給 LLM 參考
+            )
             return answer
 
         except Exception as e:

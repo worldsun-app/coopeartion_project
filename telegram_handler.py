@@ -9,7 +9,6 @@ from gcp_service import GcpService
 from generate import answer_question, summarize_conversation, answer_with_grounding, summarize_segment, extract_product_from_query, extract_keywords_from_query
 
 
-# 以簡單的 in-memory 狀態記錄對話（可換成 Redis/DB）
 CONV: Dict[int, Dict[str, Any]] = {}
 
 def inject_services(app: Application, notion: NotionService, gcp_service: GcpService):
@@ -43,7 +42,6 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # --- 新邏輯開始 ---
-    # 不論是哪種用法，第一個參數都是客戶名稱
     customer_name = args[0]
     notion: NotionService = context.application.bot_data["notion"]
     
@@ -67,7 +65,6 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     title = page.get("_title") or "未命名"
     portrait = notion.get_page_portrait_section(page_id)
 
-    # 為兩種情況都預先設定好對話狀態
     CONV[chat_id] = {
         "customer_title": title,
         "page_id": page_id,
@@ -75,15 +72,12 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "history": [],
     }
 
-    # 根據參數數量決定執行問答還是僅載入資料
     if len(args) >= 2:
-        # 用法一：/ask [客戶名稱] [問題]
         question = " ".join(args[1:])
         await update.message.reply_text("正在為您分析客戶畫像並生成回覆，請稍候...")
         
         answer = await answer_question(title, portrait, question)
         
-        # 記錄問題和答案到歷史紀錄
         CONV[chat_id]["history"].append({"role": "user", "content": question})
         CONV[chat_id]["history"].append({"role": "assistant", "content": answer})
         
@@ -93,13 +87,11 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "（可成員討論，或使用 /query, /products 等指令詢問，或用 /end 結束）"
         )
     else:
-        # 用法二：/ask [客戶名稱]
         question = ""
         await update.message.reply_text("正在為您分析客戶畫像並生成回覆，請稍候...")
         
         answer = await answer_question(title, portrait, question)
-        
-        # 記錄問題和答案到歷史紀錄
+
         CONV[chat_id]["history"].append({"role": "user", "content": question})
         CONV[chat_id]["history"].append({"role": "assistant", "content": answer})
         
@@ -120,11 +112,12 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     page_id = state["page_id"]
     title = state["customer_title"]
     history = state["history"]
-
-    # 1. 產生摘要
     summary_text = await summarize_conversation(title, history)
 
-    # 2. 準備寫入 Notion 的 blocks
+    # 將 summary_text 按照 Notion 的 2000 字元限制進行切割
+    char_limit = 2000
+    summary_chunks = [summary_text[i:i+char_limit] for i in range(0, len(summary_text), char_limit)]
+
     blocks_to_append = [
         {
             "object": "block",
@@ -132,22 +125,24 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "heading_2": {
                 "rich_text": [{"type": "text", "text": {"content": f"與 {update.message.from_user.full_name} 的討論摘要"}}]
             }
-        },
-        {
+        }
+    ]
+        
+    # 為每一個切割後的文字塊建立一個 paragraph block
+    for chunk in summary_chunks:
+        blocks_to_append.append({
             "object": "block",
             "type": "paragraph",
             "paragraph": {
-                "rich_text": [{"type": "text", "text": {"content": summary_text}}]
+                "rich_text": [{"type": "text", "text": {"content": chunk}}]
             }
-        },
-        {
-            "object": "block",
-            "type": "divider",
-            "divider": {}
-        }
-    ]
+        })
 
-    # 3. 寫入 Notion
+    blocks_to_append.append({
+        "object": "block",
+        "type": "divider",
+        "divider": {}
+    })
     try:
         notion: NotionService = context.application.bot_data["notion"]
         notion.append_blocks_to_page(page_id, blocks_to_append)
@@ -155,7 +150,6 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         await update.message.reply_text(f"寫入 Notion 時發生錯誤：{e}")
     finally:
-        # 4. 結束會談
         del CONV[chat_id]
 
 async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -173,7 +167,6 @@ async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     state = CONV[chat_id]
     history = state["history"]
 
-    # 1. 找出最近的對話片段作為上下文
     last_assistant_index = -1
     for i in range(len(history) - 1, -1, -1):
         if history[i]["role"] == "assistant":
@@ -189,20 +182,17 @@ async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         prompt_context = f"請參考以下團隊成員的討論：\n---\n{discussion_summary}\n---\n"
     
     full_question = f"{prompt_context}基於以上討論，請回答這個問題：{new_question}"
-    
-    # 2. 產生並回覆答案
+
     await update.message.reply_text("正在整合討論內容並為您查詢，請稍候...")
     answer = await answer_with_grounding(full_question)
     await update.message.reply_text(answer)
 
-    # 3. 在背景進行滾動式摘要
     segment_to_summarize = (history[last_assistant_index:] if last_assistant_index != -1 else history).copy()
     segment_to_summarize.append({"role": "user", "content": new_question})
     segment_to_summarize.append({"role": "assistant", "content": answer})
 
     summary_text = await summarize_segment(segment_to_summarize)
-    
-    # 用摘要取代原始的對話片段
+
     history_before_segment = history[:last_assistant_index] if last_assistant_index != -1 else []
     CONV[chat_id]["history"] = history_before_segment + [
         {"role": "assistant", "content": summary_text}
@@ -223,10 +213,8 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state = CONV[chat_id]
     history = state["history"]
 
-    # 智慧篩選：從問題中提取產品名稱
     product_filter = await extract_product_from_query(user_query)
 
-    # 找出最近的對話片段作為上下文
     last_assistant_index = -1
     for i in range(len(history) - 1, -1, -1):
         if history[i]["role"] == "assistant":
@@ -242,24 +230,24 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context_for_search = f"請參考以下團隊成員的討論摘要：\n---\n{discussion_summary}\n---\n"
 
     base_query = f"{context_for_search}根據上述討論，請到公司產品資料庫中搜尋並回答：{user_query}"
-    
-    # 如果提取到產品名稱，則重組查詢
-    if product_filter:
+
+    if product_filter != '':
         final_query = f'("{product_filter}") AND ({base_query})'
         await update.message.reply_text(f"好的，正在為您聚焦搜尋「{product_filter}」的相關資料...")
     else:
         final_query = base_query
         await update.message.reply_text("正在參考討論內容，到公司產品資料庫搜尋，請稍候...")
+    
+    print(final_query)
 
     gcp_service: GcpService = context.application.bot_data["gcp"]
     answer = gcp_service.query_knowledge_base(
-        user_question=user_query,      # 使用者原始案例
-        product_filter=product_filter, # 若你有從 /products 的問題再抽產品名
-        search_query=final_query,      # 你組出來的強化版查詢
+        user_question=user_query,
+        product_filter=product_filter,
+        search_query=final_query, 
     )
     await update.message.reply_text(answer)
 
-    # 在背景進行滾動式摘要
     segment_to_summarize = (history[last_assistant_index:] if last_assistant_index != -1 else history).copy()
     segment_to_summarize.append({"role": "user", "content": f"/products {user_query}"})
     segment_to_summarize.append({"role": "assistant", "content": answer})
@@ -276,9 +264,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """處理一般訊息，當作討論內容記錄下來"""
     chat_id = update.message.chat_id
     if chat_id not in CONV:
-        return  # 非對話模式下，忽略一般訊息
+        return
 
-    # 將訊息存入歷史紀錄，標記為討論
     state = CONV[chat_id]
     user = update.message.from_user
     message_text = update.message.text
@@ -299,12 +286,11 @@ async def direct_database_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("請輸入您要查詢產品資料庫的問題：/search_db [你的問題]")
         return
     user_query = " ".join(args)
-    # 步驟 1: 提取產品名稱
     product_filter = await extract_product_from_query(user_query)
-    # 步驟 2: 提取關鍵字
+
     keywords = await extract_keywords_from_query(user_query)
     final_query = ""
-    # 步驟 3: 根據提取結果建立查詢
+
     if keywords:
         keyword_query_part = " OR ".join([f'"{k}"' for k in keywords])
         keyword_query = f"({keyword_query_part})"
@@ -325,8 +311,8 @@ async def direct_database_command(update: Update, context: ContextTypes.DEFAULT_
 
     gcp_service: GcpService = context.application.bot_data["gcp"]
     answer = gcp_service.query_knowledge_base(
-        user_question=user_query,       # 直接用使用者原始敘述
+        user_question=user_query,
         product_filter=product_filter,
-        search_query=final_query,       # 這個是你為 Search 組好的關鍵字
+        search_query=final_query,
     )
     await update.message.reply_text(answer)
