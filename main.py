@@ -25,6 +25,7 @@ def main():
     gcp_location = os.getenv("GCP_LOCATION") # In gcp_search.py, this is 'us'
     gcp_engine_id = os.getenv("GCP_ENGINE_ID")
     gcp_credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    gcp_bucket_name = os.getenv("GCP_BUCKET_NAME")
 
     if not tg_token:
         raise RuntimeError("請在 .env 內設定 TELEGRAM_BOT_TOKEN")
@@ -39,7 +40,8 @@ def main():
         project_id=gcp_project_id,
         location=gcp_location,
         engine_id=gcp_engine_id,
-        credentials_path=gcp_credentials_path
+        credentials_path=gcp_credentials_path,
+        bucket_name=gcp_bucket_name
     )
 
     # Telegram Application

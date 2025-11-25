@@ -19,12 +19,35 @@ except Exception as e:
     print(f"無法初始化 Gemini Client: {e}")
     client = None
 
-def _build_user_prompt(title: str, portrait: str, question: str) -> str:
+def _build_user_prompt(title: str, portrait: str, question: str, history: List[Dict[str, str]] | None = None) -> str:
     """建立用於問答的提示"""
+    history_context = ""
+    if history:
+        role_map = {
+            "user": "提問者",
+            "assistant": "機器人",
+            "discussion": "團隊討論"
+        }
+        transcript_lines = []
+        for msg in history:
+            role = msg.get("role", "unknown")
+            if role == 'discussion':
+                transcript_lines.append(f"- {msg.get('content', '')}")
+            else:
+                speaker = role_map.get(role, "發言者")
+                transcript_lines.append(f"{speaker}: {msg.get('content', '')}")
+        
+        transcript = "\n".join(transcript_lines)
+        history_context = (
+            f"以下是過去的對話歷史與摘要，請作為你回答的參考：\n"
+            f"---\n{transcript}\n---\n\n"
+        )
+
     return (
-        f"您好，您是公司內部成員的助理，正在協助團隊針對客戶進行客觀分析與討論。"
-        f"請根據以下客戶畫像（特別是客戶的人格特質、著重事項及目前資金配置），以客觀公正的立場，簡潔地回答以下問題。"
+        f"您好，您是公司內部成員的助理，正在協助團隊針對客戶進行客觀分析與討論。\n"
+        f"請根據以下客戶畫像（特別是客戶的人格特質、著重事項及目前資金配置），並參考對話歷史，以客觀公正的立場，簡潔地回答以下問題。\n"
         f"無須前言以及後述。\n\n"
+        f"{history_context}"
         f"客戶名稱：{title}\n"
         f"客戶畫像（節錄）：\n{portrait}\n\n"
         f"問題：{question}\n"
@@ -36,11 +59,11 @@ def _build_user_prompt(title: str, portrait: str, question: str) -> str:
         f"5) {question} 回覆：[針對問題的簡短客觀回答]"
     )
 
-async def answer_question(title: str, portrait: str, question: str) -> str:
+async def answer_question(title: str, portrait: str, question: str, history: List[Dict[str, str]] | None = None) -> str:
     """
     呼叫 Gemini API 回答問題。
     """
-    prompt = _build_user_prompt(title, portrait, question)
+    prompt = _build_user_prompt(title, portrait, question, history)
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",

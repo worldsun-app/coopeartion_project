@@ -8,8 +8,11 @@ dependencies = [
     "aiohttp>=3.13.2",
     "google-cloud-aiplatform>=1.126.1",
     "google-cloud-discoveryengine>=0.15.0",
+    "google-cloud-storage>=3.5.0",
     "google-genai>=1.48.0",
     "notion-client>=2.7.0",
     "python-dotenv>=1.2.1",
     "python-telegram-bot>=22.5",
+    "rapidfuzz>=3.14.3",
+    "redis>=7.1.0",
 ]
