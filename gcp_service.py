@@ -1,5 +1,6 @@
 import os
-from rapidfuzz import fuzz
+import re
+import numpy as np
 from google.api_core.client_options import ClientOptions
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.oauth2 import service_account
@@ -7,6 +8,7 @@ from google.cloud import storage
 
 from google import genai
 from google.genai import types as genai_types
+from google.genai.types import EmbedContentConfig
 
 class GcpService:
     def __init__(self, project_id: str, location: str, engine_id: str, credentials_path: str, bucket_name: str):
@@ -16,9 +18,17 @@ class GcpService:
         self.credentials_path = credentials_path
         self.bucket_name = bucket_name
         self.credentials = service_account.Credentials.from_service_account_file(self.credentials_path)
+        self.genai_client = genai.Client(
+            vertexai=True,
+            project=self.project_id,
+            location="us-central1",
+            credentials=self.credentials.with_scopes(["https://www.googleapis.com/auth/cloud-platform"]),
+            http_options=genai_types.HttpOptions(api_version="v1"),
+        )
         self.client, self.serving_config = self._init_discovery_client()
         self.storage_client = storage.Client(credentials=self.credentials, project=project_id)
         self.product_files = self._fetch_all_filenames()
+        self.file_index = self._build_filename_index()
 
     def _init_discovery_client(self):
         """初始化 Vertex AI Search 的 client。"""
@@ -26,14 +36,11 @@ class GcpService:
             api_endpoint = "discoveryengine.googleapis.com"
         else:
             api_endpoint = f"{self.location}-discoveryengine.googleapis.com"
-
         client_options = ClientOptions(api_endpoint=api_endpoint)
-
         client = discoveryengine.SearchServiceClient(
             credentials=self.credentials,
             client_options=client_options,
         )
-
         serving_config = (
             f"projects/{self.project_id}"
             f"/locations/{self.location}"
@@ -47,8 +54,6 @@ class GcpService:
         """從 GCS Bucket 獲取所有檔案名稱，用於模糊匹配"""
         try:
             blobs = self.storage_client.list_blobs(self.bucket_name)
-            # 提取檔名，去除副檔名，例如 "重疾-友邦香港愛伴航系列 - 產品手冊.pdf" -> "重疾-友邦香港愛伴航系列 - 產品手冊"
-            # 同時保留原始完整檔名以便後續對照（視 Vertex AI Search 的 Title 欄位而定，通常是檔名）
             file_list = []
             for blob in blobs:
                 filename = os.path.basename(blob.name)
@@ -62,45 +67,72 @@ class GcpService:
             print(f"ERROR: 無法讀取 GCS Bucket: {e}")
             return []
         
-    def _match_filenames_fuzzy(self, keyword: str) -> list[dict]:
-        """
-        使用多種策略回傳匹配到的完整檔案資訊列表。
-        策略順序：
-        1. 類別標籤匹配 (針對 '分紅-xxx' 格式)
-        2. Fuzzy Token Set Ratio (針對同音異字或部分匹配)
-        """
-        if not keyword:
+    def _get_embedding(self, text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
+        """呼叫 Vertex AI 取得向量"""
+        try:
+            response = self.genai_client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=text,
+                config=EmbedContentConfig(task_type=task_type)
+            )
+            return response.embeddings[0].values
+        except Exception as e:
+            print(f"ERROR: 計算 Embedding 失敗 ({text}): {e}")
             return []
         
-        matches = []
-        clean_keyword = keyword.strip().replace('"', '').replace("'", "")
-        
-        # 設定模糊比對門檻
-        THRESHOLD = 60 
-
+    def _build_filename_index(self):
+        """
+        預先計算所有檔名的 Embedding 並存入記憶體。
+        這會在程式啟動時執行一次。
+        """
+        print("INFO: 正在建立檔案名稱的語意向量索引 (Embedding Index)...")
+        index = []
         for file_info in self.product_files:
-            clean_name = file_info["clean_name"]
-            
-            # --- 策略 1: 類別標籤匹配 (針對您的檔名結構優化) ---
-            if "-" in clean_name:
-                # 取得減號前的部分當作類別 (例如 "分紅", "重疾")
-                category_tag = clean_name.split("-")[0].strip()
-                # 只有當標籤長度大於等於2 (避免匹配到無意義單字) 且 關鍵字包含此標籤時
-                if len(category_tag) >= 2 and category_tag in clean_keyword:
-                    print(f"DEBUG: Category Match '{category_tag}' found in keyword '{clean_keyword}' -> Match '{clean_name}'")
-                    matches.append(file_info)
-                    continue # 匹配成功，跳過後續檢查，處理下一個檔案
-            # --- 策略 2: RapidFuzz Token Set Ratio (原本的模糊比對) ---
-            score = fuzz.token_set_ratio(clean_keyword, clean_name)
-            if score >= THRESHOLD:
-                print(f"DEBUG: Fuzzy Match (token_set) '{clean_keyword}' vs '{clean_name}' = {score}")
-                matches.append(file_info)
-                continue
-        # 去重邏輯
-        unique_matches = {m["blob_name"]: m for m in matches}.values()
-        return list(unique_matches)
+            vector = self._get_embedding(file_info["clean_name"], task_type="RETRIEVAL_DOCUMENT")
+            if vector:
+                index.append({
+                    "info": file_info,
+                    "vector": np.array(vector)
+                })
+        
+        print(f"INFO: 向量索引建立完成，共 {len(index)} 筆。")
+        return index
 
-    def _search_segments(self, user_question, filter_str: str = None, product_filter: str = None, search_query: str = None, max_results=5, top_segments=12):
+    def _match_filenames_by_vector(self, keyword: str, top_k: int = 3, threshold1: float = 0.55) -> list[tuple[float, dict]]:
+        """
+        使用向量相似度 (Cosine Similarity) 找出最相關的檔案。
+        """
+        if not keyword or not self.file_index:
+            return []
+        query_vector = np.array(self._get_embedding(keyword, task_type="RETRIEVAL_QUERY"))
+        if query_vector.size == 0:
+            return []
+        matches = []
+        norm_q = np.linalg.norm(query_vector)
+        for item in self.file_index:
+            file_vector = item["vector"]
+            norm_f = np.linalg.norm(file_vector)
+            if norm_q == 0 or norm_f == 0:
+                score = 0.0
+            else:
+                score = np.dot(query_vector, file_vector) / (norm_q * norm_f)
+            if score >= threshold1:
+                matches.append((score, item["info"]))
+
+        high_confidence_matches = [m for m in matches if m[0] >= 0.7]
+        if high_confidence_matches:
+            final_matches = high_confidence_matches
+        else:
+            final_matches = matches
+        final_matches.sort(key=lambda x: x[0], reverse=True)
+        
+        print(f"DEBUG: '{keyword}' 的向量匹配結果:")
+        for score, info in final_matches[:top_k]:
+            print(f"  - [{score:.4f}] {info['clean_name']}")
+
+        return final_matches[:top_k]
+
+    def _search_segments(self, user_question, filter_str: str = None, product_filter: str = None, search_query: str = None, max_results=5, top_segments=12, allowed_filenames: list[str] = None):
         """
         用 Vertex AI Search 取得與問題最相關的段落（extractive segments），
         回傳一個 list，每個元素包含 text / source_title / page。
@@ -140,29 +172,28 @@ class GcpService:
                 )
             ),
         )
-        if not search_query:
-            search_query = user_question
-            if product_filter:
-                search_query = f"{user_question} {product_filter}"
-
+        final_query = search_query or user_question
         request = discoveryengine.SearchRequest(
             serving_config=self.serving_config,
-            query=search_query,
+            query=final_query,
             page_size=max_results,
             content_search_spec=content_search_spec,
             filter=filter_str,
         )
-        search_pager = self.client.search(request)
-        response = next(search_pager.pages)
-        # print("DEBUG: total results =", len(response.results))
+        try:
+            search_pager = self.client.search(request)
+            response = next(search_pager.pages)
+            print(f"DEBUG: Vertex Search found {len(response.results)} documents.")
+        except Exception as e:
+            print(f"Vertex Search Error: {e}")
+            return [], None
 
         segments_info = []
         for i, result in enumerate(response.results, start=1):
             doc = result.document
             derived_data = dict(doc.derived_struct_data) if doc.derived_struct_data else {}
-            # print(f"=== Result {i} derived_struct_data ===")
-            # print(derived_data)
-            raw_title = (derived_data.get("title")or derived_data.get("document_title"))
+            
+            raw_title = (derived_data.get("title") or derived_data.get("document_title"))
             link = derived_data.get("link")
             filename_title = None
             if link:
@@ -171,30 +202,25 @@ class GcpService:
                     path_part = link.split("/", 1)[-1]
                 filename = os.path.basename(path_part)
                 filename_title = os.path.splitext(filename)[0]
-            if raw_title and filename_title:
-                title = f"{filename_title}（{raw_title}）"
-            else:
-                title = raw_title or filename_title or "未命名文件"
+            
+            title = f"{filename_title}（{raw_title}）" if (raw_title and filename_title) else (raw_title or filename_title or "未命名文件")
+
+            if allowed_filenames:
+                if filename_title not in allowed_filenames:
+                    print(f"DEBUG: Skipping result '{title}' as it is not in allowed filenames.")
+                    continue
 
             segments = derived_data.get("extractive_segments", [])
             for seg in segments:
                 text = seg.get("content", "")
-                if not text:
-                    continue
+                if not text: continue
                 page = seg.get("pageNumber")
                 score = seg.get("score") or seg.get("confidenceScore") or 1.0
-                segments_info.append(
-                    {
-                        "text": text,
-                        "source_title": title,
-                        "page": page,
-                        "score": float(score),
-                    }
-                )
+                segments_info.append({"text": text, "source_title": title, "page": page, "score": float(score)})
+
         segments_info.sort(key=lambda x: x["score"], reverse=True)
-        selected_segments = segments_info[:top_segments]
-        print(f"\nDEBUG: collected segments = {len(segments_info)}, selected = {len(selected_segments)}")
-        return segments_info, getattr(response, "summary", None)
+        print(f"DEBUG: _search_segments extracted {len(segments_info)} segments.")
+        return segments_info[:top_segments], getattr(response, "summary", None)
 
     def _generate_with_gemini(self, user_question, segments, summary_obj=None, product_filter: str = None, extra_context: str = None):
         """
@@ -206,16 +232,6 @@ class GcpService:
             product_filter: 產品過濾器 (可選)
             extra_context: 額外的上下文資訊 (例如客戶資料、對話歷史)，通常來自 search_query 的前半部
         """
-        scoped_credentials = self.credentials.with_scopes(
-            ["https://www.googleapis.com/auth/cloud-platform"]
-        )
-        client = genai.Client(
-            vertexai=True,
-            project=self.project_id,
-            location="us-central1",
-            credentials=scoped_credentials,
-            http_options=genai_types.HttpOptions(api_version="v1"),
-        )
         if not segments and summary_obj and getattr(summary_obj, "summary_text", None):
             context_text = summary_obj.summary_text
         else:
@@ -243,8 +259,9 @@ class GcpService:
             2. 如果是根據【參考資訊】進行的邏輯推演或建議（例如：「因為客戶有XX需求，所以建議...」），則不需要標註產品出處，但必須說明理由。
             3. 如果【產品資料片段】中完全沒有相關資訊可以支持你的回答或建議，請誠實告知：「根據目前的產品資料庫，無法找到合適的產品資訊。」
             4. 嚴禁捏造產品內容。
-            5. "禁止任何前言、問候、自我介紹、後序等贅述，直接切入重點回答客戶問題。"
-            6. "回答使用一般文字格式，不要使用任何標記語言（例如 Markdown）、也不使用任何標記符號 (例如 *、#）。"
+            5. 禁止任何前言、問候、自我介紹、後序等贅述，直接切入重點回答客戶問題。
+            6. 回答使用一般文字格式，使用純文字輸出，不要使用任何標記語言（例如 Markdown）、也不使用任何標記符號 (例如 *、#）。
+            7. 回答必須使用繁體中文。
         """
         
         if product_filter:
@@ -258,76 +275,110 @@ class GcpService:
             {user_question}
             請開始回答：
         """
-        response = client.models.generate_content(
+        response = self.genai_client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
         )
         return response.text
 
-    def query_knowledge_base(self, user_question: str, product_filter: str | None = None, search_query: str | None = None) -> str:
+    def query_knowledge_base(self, user_question: str, product_filter: str | None = None, search_query: str | None = None, conversation_history: str | None = None) -> str:
         print(f"INFO: 開始查詢，Filter Term: {product_filter}, User Question: {user_question}")
-        
-        matched_files = []
-        display_names = []
-        final_search_query = search_query or user_question # 預設查詢
 
+        final_segments = []
+        display_names_all = []
+
+        TOTAL_SEGMENT_TARGET = 12
         if product_filter:
-            keywords = [k.strip() for k in product_filter.replace('"', '').replace("'", "").split(',')]
+            clean_filter = product_filter.replace('"', '').replace("'", "")
+            keywords = [k.strip() for k in re.split(r'[,\n]+', clean_filter) if k.strip()]
             
-            all_matched_files = []
-            for kw in keywords:
-                if kw:
-                    # 對每個分割後的關鍵字進行模糊匹配
-                    found = self._match_filenames_fuzzy(kw)
-                    all_matched_files.extend(found)
-            
-            # 去重：避免重複加入相同的檔案 (根據 blob_name 去重)
-            if all_matched_files:
-                unique_matches = {m["blob_name"]: m for m in all_matched_files}.values()
-                matched_files = list(unique_matches)
+            if keywords:
+                quota_per_product = max(1, TOTAL_SEGMENT_TARGET // len(keywords))
+                print(f"INFO: 偵測到 {len(keywords)} 個產品，每個產品分配 {quota_per_product} 個段落配額。")
 
-                matched_names = [f['clean_name'] for f in matched_files]
-                display_names = matched_names
-                print(f"INFO: 關鍵字 '{product_filter}' 本地匹配到檔案: {matched_names}")
-                
-                files_context_str = " ".join(matched_names)
-                
-                final_search_query = f"{files_context_str} {user_question}"
-                print(f"INFO: Search Query: {final_search_query}")
-            else:
-                print(f"WARN: 關鍵字 '{product_filter}' 沒有匹配到任何本地檔案，將使用原始查詢。")
+                for kw in keywords:
+                    found = self._match_filenames_by_vector(kw, top_k=3) 
+                    if not found: continue
 
-        try:
-            # 注意：這裡 filter_str 永遠傳 None，避免 400 錯誤
-            segments, summary_obj = self._search_segments(
-                user_question=user_question,
-                search_query=final_search_query, # 傳入組裝好的 Query
-                filter_str=None, # 這裡設為 None
+                    valid_infos = []
+                    kw_chars = set(kw.lower())
+                    for score, info in found:
+                        clean_name = info['clean_name'].lower()
+                        overlap_count = sum(1 for char in kw_chars if char in clean_name)
+                        coverage = overlap_count / len(kw_chars) if kw_chars else 0.0
+                        if score >= 0.7:
+                            threshold = 0.5
+                        else:
+                            threshold = 1.0 if len(kw_chars) < 3 else 0.6 
+                        if coverage >= threshold:
+                            valid_infos.append(info)
+                    if not valid_infos: continue
+                    
+                    valid_names = [info['clean_name'] for info in valid_infos]
+                    display_names_all.extend(valid_names)
+
+                    files_context_str = " ".join([f'{name}' for name in valid_names])
+                    mining_question = f"請詳細說明 {kw} 的產品特色、保障範圍與條款細節。"
+                    
+                    safe_user_query = user_question.replace("比較", "說明").replace("區別", "介紹").replace("差別", "內容")
+                    single_product_query = f"{files_context_str} {kw} {safe_user_query} 產品手冊 條款"
+                    
+                    print(f"INFO: 執行子查詢 (資料探勘模式):")
+                    print(f"  - Mining Question: {mining_question}")
+                    print(f"  - Search Query: {single_product_query}")
+                    # print(f"  - Filter: {filter_str}")
+
+                    segs, _ = self._search_segments(
+                        user_question=mining_question,
+                        search_query=single_product_query,
+                        filter_str=None,
+                        max_results=5, 
+                        top_segments=quota_per_product,
+                        allowed_filenames=valid_names
+                    )
+                    final_segments.extend(segs)
+
+        if not final_segments:
+            print("INFO: 無法執行多產品分別搜尋，切換回單次搜尋模式。")
+            final_search_query = search_query or user_question
+            allowed_filenames = None
+
+            vector_matches = self._match_filenames_by_vector(user_question, top_k=5)
+            if vector_matches:
+                print(f"INFO: 單次搜尋模式下，透過向量搜尋找到 {len(vector_matches)} 個相關檔案。")
+                allowed_filenames = [info['clean_name'] for _, info in vector_matches]
+                print(allowed_filenames)
+                display_names_all.extend(allowed_filenames)
+
+            final_segments, summary_obj = self._search_segments(
+                user_question,
+                search_query=final_search_query,
+                filter_str=None,
                 max_results=5, 
-                top_segments=12
+                top_segments=TOTAL_SEGMENT_TARGET,
+                allowed_filenames=allowed_filenames 
             )
+            if not final_segments and not (summary_obj and summary_obj.summary_text):
+                return "根據目前索引到的文件，找不到相關內容。"
 
-            if not segments and not (summary_obj and summary_obj.summary_text):
-                msg = "根據目前索引到的文件，找不到相關內容。"
-                if display_names:
-                    msg += f" (已嘗試搜尋：{', '.join(display_names)}，但未發現具體內容)"
-                return msg
+        print(f"DEBUG: Final segments count: {len(final_segments)}")
+        source_titles = set(s.get('source_title') for s in final_segments)
+        print(f"DEBUG: Sources in final_segments: {source_titles}")
 
-            # 雖然沒有用 Filter，但我們還是要告訴 Gemini 我們主要鎖定了哪些檔案
-            context_info = user_question
-            if display_names:
-                prefix = "系統已根據檔名優先檢索以下文件：\n"
-                context_info = prefix + "\n".join(display_names) + f"\n\n原始問題：{user_question}"
+        context_info = user_question
+        if display_names_all:
+            unique_names = list(set(display_names_all))
+            prefix = "系統已分別檢索以下產品文件：\n"
+            context_info = prefix + "\n".join(unique_names) + f"\n\n原始問題：{user_question}"
+        
+        if conversation_history:
+            context_info = f"{context_info}\n\n【對話歷史與上下文】\n{conversation_history}"
 
-            answer = self._generate_with_gemini(
-                user_question=user_question, 
-                segments=segments, 
-                summary_obj=summary_obj, 
-                product_filter=product_filter,
-                extra_context=context_info
-            )
-            return answer
-
-        except Exception as e:
-            print(f"ERROR: 查詢過程發生錯誤: {e}")
-            return "抱歉，系統發生錯誤，請檢查後台日誌。"
+        answer = self._generate_with_gemini(
+            user_question=user_question, 
+            segments=final_segments, 
+            summary_obj=None,
+            product_filter=product_filter,
+            extra_context=context_info
+        )
+        return answer

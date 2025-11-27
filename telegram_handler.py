@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import ContextTypes, Application
 from notion_service import NotionService
 from gcp_service import GcpService
-from generate import answer_question, summarize_conversation, answer_with_grounding, summarize_segment, extract_product_from_query, extract_keywords_from_query
+from generate import answer_question, summarize_conversation, answer_with_grounding, summarize_segment, extract_product_from_query, extract_keywords_from_query, refine_summary
 
 # 串接 Redis 客戶端
 from redis_client import get_conv_state, set_conv_state, delete_conv_state
@@ -29,7 +29,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "在載入客戶資料後，您可以使用以下指令：\n"
         "- `/query [問題]`: 根據當前討論向 AI 提問。\n"
         "- `/products [問題]`: 根據當前討論搜尋產品資料庫。\n"
-        "- `/end`: 結束目前對話，並將討論摘要寫入 Notion。\n"
+        "- `/end`: 結束目前對話，並生成摘要準備寫入Notion。\n"
+        "--- `/save`: 儲存目前的摘要到 Notion。\n"
         "- `/cancel`: 中斷目前對話，不儲存任何內容。\n\n"
         "獨立指令：\n"
         "- `/search_db [你的問題]`: 直接查詢公司產品資料庫，可包含產品名稱以聚焦搜尋。\n"
@@ -123,20 +124,52 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
 async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    結束指令第一階段：生成摘要並讓使用者預覽/修改
+    """
     chat_id = update.message.chat_id
     state = get_conv_state(chat_id)
 
     if not state:
-        await update.message.reply_text("目前沒有進行中的會談。" )
+        await update.message.reply_text("目前沒有進行中的會談。")
         return
 
-    await update.message.reply_text("正在為您總結對話並寫入 Notion，請稍候...")
+    await update.message.reply_text("正在為您總結對話，請稍候...")
 
     page_id = state["page_id"]
     title = state["customer_title"]
     history = state["history"]
     summary_text = await summarize_conversation(title, history)
 
+    state["pending_summary"] = summary_text
+    state["awaiting_save"] = True 
+    set_conv_state(chat_id, state)
+
+    # 3. 回傳給使用者預覽
+    await update.message.reply_text(
+        f"【討論摘要初稿】\n\n{summary_text}\n\n"
+        "-----------------------------\n"
+        "請確認以上內容：\n"
+        "若需 **修改**，請直接發送新的摘要內容。\n"
+        "若 **確認無誤**，請輸入 `/save` 將其寫入 Notion 並結束會談。"
+    )
+
+async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    結束指令第二階段：將確認後的摘要寫入 Notion
+    """
+    chat_id = update.message.chat_id
+    state = get_conv_state(chat_id)
+
+    if not state or not state.get("awaiting_save"):
+        await update.message.reply_text("目前沒有等待儲存的摘要。請先使用 /end 生成摘要。")
+        return
+
+    summary_text = state.get("pending_summary", "")
+    page_id = state["page_id"]
+    title = state["customer_title"]
+
+    await update.message.reply_text("正在寫入 Notion...")
     char_limit = 2000
     summary_chunks = [summary_text[i:i+char_limit] for i in range(0, len(summary_text), char_limit)]
 
@@ -168,12 +201,45 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         notion: NotionService = context.application.bot_data["notion"]
         notion.append_blocks_to_page(page_id, blocks_to_append)
-        await update.message.reply_text(f"已將本次討論摘要寫入 Notion 頁面：【{title}】")
-    except Exception as e:
-        await update.message.reply_text(f"寫入 Notion 時發生錯誤：{e}")
-    finally:
-        # --- 修改：從 Redis 刪除會談 ---
+        await update.message.reply_text(f"✅ 已將本次討論摘要寫入 Notion 頁面：【{title}】\n會談已正式結束。")
+
         delete_conv_state(chat_id)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ 寫入 Notion 時發生錯誤：{e}\n請稍後重新嘗試輸入 `/save`。")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """處理一般訊息：可能是討論內容，也可能是修改摘要"""
+    chat_id = update.message.chat_id
+    state = get_conv_state(chat_id)
+
+    if not state:
+        return
+
+    message_text = update.message.text
+
+    if state.get("awaiting_save"):
+        await update.message.reply_text("正在根據您的指令修訂摘要，請稍候...")
+        new_summary = await refine_summary(state["pending_summary"], message_text)
+        
+        state["pending_summary"] = new_summary
+        set_conv_state(chat_id, state)
+        
+        await update.message.reply_text(
+            f"【修訂後的摘要】\n\n{new_summary}\n\n"
+            "-----------------------------\n"
+            "請確認以上內容：\n"
+            "若需 **繼續修改**，請直接發送新的指令。\n"
+            "若 **確認無誤**，請輸入 `/save` 確認儲存。"
+        )
+        return
+
+    user = update.message.from_user
+    state["history"].append({
+        "role": "discussion",
+        "content": f"{user.full_name}: {message_text}"
+    })
+    set_conv_state(chat_id, state)
 
 async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
@@ -219,7 +285,6 @@ async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     history_before_segment = history[:last_assistant_index] if last_assistant_index != -1 else []
     
-    # --- 修改：更新 Redis 中的狀態 ---
     state["history"] = history_before_segment + [
         {"role": "assistant", "content": summary_text}
     ]
@@ -241,13 +306,11 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_query = " ".join(args)
     history = state["history"]
 
-    # 同時提取產品篩選器和關鍵字
     product_filter = await extract_product_from_query(user_query)
     keywords = await extract_keywords_from_query(user_query)
 
     matching_term = product_filter
     if not matching_term and keywords:
-        # 將關鍵字列表組合成字串，作為匹配依據
         matching_term = ",".join(keywords)
         print(f"DEBUG: No product name found, using keywords as filter: {matching_term}")
 
@@ -267,7 +330,6 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     base_query = f"{context_for_search}根據上述討論，請到公司產品資料庫中搜尋並回答：{user_query}"
     
-    # 建立最終查詢
     final_query = base_query
     query_parts = []
     if keywords:
@@ -280,7 +342,6 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         final_query = user_query 
 
-    # 回覆使用者訊息
     if matching_term: # 改用 matching_term 判斷
         final_query = f'"{matching_term}" AND {final_query}' # 這裡其實只是增加權重，核心還是靠 gcp_service 的注入
         await update.message.reply_text(f"好的，正在為您搜尋關於「{matching_term}」的相關資料...")
@@ -290,8 +351,9 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     gcp_service: GcpService = context.application.bot_data["gcp"]
     answer = gcp_service.query_knowledge_base(
         user_question=user_query,
-        product_filter=matching_term, # --- 重點：傳入 matching_term ---
+        product_filter=matching_term,
         search_query=final_query, 
+        conversation_history=context_for_search
     )
     await update.message.reply_text(answer)
 
@@ -303,31 +365,11 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     history_before_segment = history[:last_assistant_index] if last_assistant_index != -1 else []
 
-    # --- 修改：更新 Redis 中的狀態 ---
     state["history"] = history_before_segment + [
         {"role": "assistant", "content": summary_text}
     ]
     set_conv_state(chat_id, state)
     print(f"DEBUG: Chat {chat_id} history compressed. New length: {len(state['history'])}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """處理一般訊息，當作討論內容記錄下來"""
-    chat_id = update.message.chat_id
-    state = get_conv_state(chat_id)
-
-    if not state:
-        return
-
-    user = update.message.from_user
-    message_text = update.message.text
-    
-    # --- 修改：更新 Redis 中的狀態 ---
-    state["history"].append({
-        "role": "discussion",
-        "content": f"{user.full_name}: {message_text}"
-    })
-    set_conv_state(chat_id, state)
-
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """處理機器人無法識別的指令"""
@@ -372,7 +414,7 @@ async def direct_database_command(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(answer)
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """【新】停止當前會談，不將任何內容儲存到 Notion。"""
+    """停止當前會談，不將任何內容儲存到 Notion。"""
     chat_id = update.message.chat_id
     if get_conv_state(chat_id):
         delete_conv_state(chat_id)

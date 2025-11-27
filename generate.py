@@ -84,7 +84,6 @@ async def summarize_conversation(title: str, history: List[Dict[str, str]]) -> s
     transcript_lines = []
     for msg in history:
         role = msg.get("role", "unknown")
-        # discussion 內容已經包含發言者名稱，不用再加標籤
         if role == 'discussion':
             transcript_lines.append(f"- {msg.get('content', '')}")
         else:
@@ -99,7 +98,7 @@ async def summarize_conversation(title: str, history: List[Dict[str, str]]) -> s
         f"---\n{transcript}\n---\n"
         f"任務：請將以上整段對話紀錄（包含問答和討論）整理成一份重點摘要，總結團隊的發現、關鍵問題點和最終結論。\n"
         f"禁止任何前言、問候、自我介紹、後序等贅述，直接切入重點回答客戶問題。"
-        f"回答使用一般文字格式，不要使用任何標記語言（例如 Markdown）、也不使用任何標記符號 (例如 *、#)。"
+        f"回答使用一般文字格式，輸出僅使用純文字，不要使用任何 Markdown 語法或是 HTML 語法、也不使用任何標記符號 (例如 *、#、**)。"
         f"格式請用項目符號（bullet points）。"
     )
 
@@ -111,6 +110,33 @@ async def summarize_conversation(title: str, history: List[Dict[str, str]]) -> s
         return response.text
     except Exception as e:
         return f"產生摘要時發生錯誤：{e}"
+
+async def refine_summary(current_summary: str, instruction: str) -> str:
+    """
+    根據使用者的指令修改現有的摘要。
+    """
+    prompt = (
+        f"任務：請根據使用者的「修改指令」，對目前的「摘要草稿」進行修訂。\n"
+        f"規則：\n"
+        f"1. 請保持原本的摘要格式（項目符號 bullet points）。\n"
+        f"2. 只進行指令要求的修改（例如刪除某點、補充某點、修正語氣等），盡量保留其他未被要求修改的內容。\n"
+        f"3. 直接輸出修訂後的完整摘要，不要包含任何前言或解釋。\n\n"
+        f"--- 摘要草稿 ---\n"
+        f"{current_summary}\n"
+        f"--- 修改指令 ---\n"
+        f"{instruction}\n"
+        f"--- 結束 ---\n\n"
+        f"修訂後的摘要："
+    )
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        return f"修訂摘要時發生錯誤：{e}"
 
 async def summarize_segment(segment: List[Dict[str, str]]) -> str:
     """將一個對話片段總結成滾動摘要"""
@@ -145,7 +171,6 @@ async def summarize_segment(segment: List[Dict[str, str]]) -> str:
             model="gemini-2.5-flash",
             contents=prompt,
         )
-        # 在摘要前加上一個標記，方便識別
         return f"【階段性摘要】\n{response.text}"
     except Exception as e:
         return f"生成階段性摘要時發生錯誤：{e}"
@@ -168,15 +193,15 @@ async def answer_with_grounding(question: str):
 async def extract_product_from_query(query: str) -> str:
     """從使用者問題中提取產品名稱"""
     prompt = (
-        f"任務：從以下「使用者問題」中，僅提取出保險產品或公司的完整名稱。\n"
+        f"任務：從以下「使用者問題」中，僅提取出公司名或公司產品名的完整名稱。\n"
         f"規則：\n"
-        f"1. 產品或公司名稱通常會出現在「在...當中」、「關於...」這類詞語的後面。\n"
-        f"2. 只回傳名稱本身，不要包含任何多餘的文字、引號或解釋。\n"
-        f"3. 如果沒有提到任何具體的產品或公司名稱，請回傳一個空字串。\n\n"
+        f"1. 只回傳名稱本身，不要包含任何多餘的文字、引號或解釋。\n"
+        f"2. 如果有兩個以上的公司名或公司產品名，請用半形逗號分開 (例如：公司A, 公司產品名B)。\n"
+        f"3. 如果沒有提到任何具體的公司名稱或是公司產品名，請回傳一個空字串。\n\n"
         f"--- 使用者問題 ---\n"
         f"{query}\n"
         f"--- 結束 ---\n\n"
-        f"產品或公司名稱："
+        f"公司名稱或公司產品名："
     )
     try:
         response = client.models.generate_content(
