@@ -1,6 +1,7 @@
 import os
 import re
 import numpy as np
+from generate import generate_with_gemini
 from google.api_core.client_options import ClientOptions
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.oauth2 import service_account
@@ -222,65 +223,6 @@ class GcpService:
         print(f"DEBUG: _search_segments extracted {len(segments_info)} segments.")
         return segments_info[:top_segments], getattr(response, "summary", None)
 
-    def _generate_with_gemini(self, user_question, segments, summary_obj=None, product_filter: str = None, extra_context: str = None):
-        """
-        使用『Google Gen AI SDK』呼叫 Vertex 上的 Gemini。
-        Args:
-            user_question: 使用者的原始問題
-            segments: 搜尋到的文件段落
-            summary_obj: 搜尋結果的摘要物件 (可選)
-            product_filter: 產品過濾器 (可選)
-            extra_context: 額外的上下文資訊 (例如客戶資料、對話歷史)，通常來自 search_query 的前半部
-        """
-        if not segments and summary_obj and getattr(summary_obj, "summary_text", None):
-            context_text = summary_obj.summary_text
-        else:
-            context_parts = [
-                f"來源文件：{seg.get('source_title', '未命名')}\n頁碼：{seg.get('page', '未知')}\n內容：\n{seg.get('text')}"
-                for seg in segments
-            ]
-            context_text = "\n\n---\n\n".join(context_parts)
-        base_instruction = """
-            你是一位專業的保險顧問。
-            你的任務是根據提供的「產品資料片段」來回答客戶問題。
-        """
-        if extra_context:
-            base_instruction += f"""
-            【參考資訊】
-            以下是客戶的背景資料或團隊討論摘要，請參考這些資訊來判斷適合的產品：
-            ---
-            {extra_context}
-            ---
-            請根據【參考資訊】中的客戶需求，從下方的【產品資料片段】中挑選最合適的產品或條款進行推薦與說明。
-            """
-        base_instruction += """
-            【回答規則】
-            1. 當你引用【產品資料片段】中的具體條款、數據或產品特色時，必須在句末標註出處，格式為 (產品名稱, 第XX頁)。
-            2. 如果是根據【參考資訊】進行的邏輯推演或建議（例如：「因為客戶有XX需求，所以建議...」），則不需要標註產品出處，但必須說明理由。
-            3. 如果【產品資料片段】中完全沒有相關資訊可以支持你的回答或建議，請誠實告知：「根據目前的產品資料庫，無法找到合適的產品資訊。」
-            4. 嚴禁捏造產品內容。
-            5. 禁止任何前言、問候、自我介紹、後序等贅述，直接切入重點回答客戶問題。
-            6. 回答使用一般文字格式，使用純文字輸出，不要使用任何標記語言（例如 Markdown）、也不使用任何標記符號 (例如 *、#）。
-            7. 回答必須使用繁體中文。
-        """
-        
-        if product_filter:
-            base_instruction += f"\n注意：你目前被限制只能討論「{product_filter}」相關的內容。"
-        prompt = f"""
-            {base_instruction}
-            --- 【產品資料片段】 ---
-            {context_text}
-            ---
-            【客戶問題】
-            {user_question}
-            請開始回答：
-        """
-        response = self.genai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        return response.text
-
     def query_knowledge_base(self, user_question: str, product_filter: str | None = None, search_query: str | None = None, conversation_history: str | None = None) -> str:
         print(f"INFO: 開始查詢，Filter Term: {product_filter}, User Question: {user_question}")
 
@@ -306,12 +248,16 @@ class GcpService:
                         clean_name = info['clean_name'].lower()
                         overlap_count = sum(1 for char in kw_chars if char in clean_name)
                         coverage = overlap_count / len(kw_chars) if kw_chars else 0.0
+                        
+                        # 修改邏輯：如果向量分數很高 (>= 0.7)，則放寬字元匹配門檻 (允許簡繁體差異)
                         if score >= 0.7:
                             threshold = 0.5
                         else:
                             threshold = 1.0 if len(kw_chars) < 3 else 0.6 
+                        
                         if coverage >= threshold:
                             valid_infos.append(info)
+                    
                     if not valid_infos: continue
                     
                     valid_names = [info['clean_name'] for info in valid_infos]
@@ -374,7 +320,8 @@ class GcpService:
         if conversation_history:
             context_info = f"{context_info}\n\n【對話歷史與上下文】\n{conversation_history}"
 
-        answer = self._generate_with_gemini(
+        answer = generate_with_gemini(
+            client=self.genai_client,
             user_question=user_question, 
             segments=final_segments, 
             summary_obj=None,

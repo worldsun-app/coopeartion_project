@@ -57,6 +57,8 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     customer_name = args[0]
     notion: NotionService = context.application.bot_data["notion"]
+    gcp: GcpService = context.application.bot_data["gcp"]
+    client = gcp.genai_client
     
     try:
         hits = notion.find_customer_pages_by_title(customer_name)
@@ -92,7 +94,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("正在為您分析客戶畫像並生成回覆，請稍候...")
         
         # --- 修改：呼叫 answer_question 時傳入 history ---
-        answer = await answer_question(title, portrait, question, history=new_state["history"])
+        answer = await answer_question(client, title, portrait, question, history=new_state["history"])
         
         # --- 修改：更新 Redis 中的狀態 ---
         current_state = get_conv_state(chat_id)
@@ -139,7 +141,9 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     page_id = state["page_id"]
     title = state["customer_title"]
     history = state["history"]
-    summary_text = await summarize_conversation(title, history)
+    gcp: GcpService = context.application.bot_data["gcp"]
+    client = gcp.genai_client
+    summary_text = await summarize_conversation(client, title, history)
 
     state["pending_summary"] = summary_text
     state["awaiting_save"] = True 
@@ -220,7 +224,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if state.get("awaiting_save"):
         await update.message.reply_text("正在根據您的指令修訂摘要，請稍候...")
-        new_summary = await refine_summary(state["pending_summary"], message_text)
+        gcp: GcpService = context.application.bot_data["gcp"]
+        client = gcp.genai_client
+        new_summary = await refine_summary(client, state["pending_summary"], message_text)
         
         state["pending_summary"] = new_summary
         set_conv_state(chat_id, state)
@@ -274,14 +280,16 @@ async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     full_question = f"{prompt_context}基於以上討論，請回答這個問題：{new_question}"
 
     await update.message.reply_text("正在整合討論內容並為您查詢，請稍候...")
-    answer = await answer_with_grounding(full_question)
+    gcp: GcpService = context.application.bot_data["gcp"]
+    client = gcp.genai_client
+    answer = await answer_with_grounding(client, full_question)
     await update.message.reply_text(answer)
 
     segment_to_summarize = (history[last_assistant_index:] if last_assistant_index != -1 else history).copy()
     segment_to_summarize.append({"role": "user", "content": new_question})
     segment_to_summarize.append({"role": "assistant", "content": answer})
 
-    summary_text = await summarize_segment(segment_to_summarize)
+    summary_text = await summarize_segment(client, segment_to_summarize)
 
     history_before_segment = history[:last_assistant_index] if last_assistant_index != -1 else []
     
@@ -305,9 +313,11 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     user_query = " ".join(args)
     history = state["history"]
+    gcp: GcpService = context.application.bot_data["gcp"]
+    client = gcp.genai_client
 
-    product_filter = await extract_product_from_query(user_query)
-    keywords = await extract_keywords_from_query(user_query)
+    product_filter = await extract_product_from_query(client, user_query)
+    keywords = await extract_keywords_from_query(client, user_query)
 
     matching_term = product_filter
     if not matching_term and keywords:
@@ -361,7 +371,7 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     segment_to_summarize.append({"role": "user", "content": f"/products {user_query}"})
     segment_to_summarize.append({"role": "assistant", "content": answer})
     
-    summary_text = await summarize_segment(segment_to_summarize)
+    summary_text = await summarize_segment(client, segment_to_summarize)
     
     history_before_segment = history[:last_assistant_index] if last_assistant_index != -1 else []
 
@@ -382,9 +392,11 @@ async def direct_database_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("請輸入您要查詢產品資料庫的問題：/search_db [你的問題]")
         return
     user_query = " ".join(args)
-    product_filter = await extract_product_from_query(user_query)
+    gcp: GcpService = context.application.bot_data["gcp"]
+    client = gcp.genai_client
+    product_filter = await extract_product_from_query(client, user_query)
 
-    keywords = await extract_keywords_from_query(user_query)
+    keywords = await extract_keywords_from_query(client, user_query)
     final_query = ""
 
     if keywords:
