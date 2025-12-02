@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import asyncio
 from typing import Dict, Any, List
 from telegram import Update
 from telegram.ext import ContextTypes, Application
@@ -125,9 +126,48 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "（可成員討論，或使用 /query, /products, /end, /cancel 等指令詢問）"
         )
 
+async def _summarize_task(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    history: List[Dict[str, str]],
+    title: str
+):
+    """在背景執行摘要生成的非同步任務"""
+    try:
+        gcp: GcpService = context.application.bot_data["gcp"]
+        client = gcp.genai_client
+        
+        summary_text = await summarize_conversation(client, title, history)
+        state = get_conv_state(chat_id)
+        if not state:
+            # 如果在此期間使用者取消了會談，state 可能會是 None
+            print(f"DEBUG: Chat {chat_id} state was deleted before summary task could complete.")
+            return
+            
+        state["pending_summary"] = summary_text
+        state["awaiting_save"] = True
+        set_conv_state(chat_id, state)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"【討論摘要初稿】\n\n{summary_text}\n\n"
+                "-----------------------------\n"
+                "請確認以上內容：\n"
+                "若需 **修改**，請直接發送修改需求。\n"
+                "若 **確認無誤**，請輸入 `/save` 將其寫入 Notion 並結束會談。"
+            )
+        )
+    except Exception as e:
+        # 4. 錯誤處理：通知使用者任務失敗
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ 生成摘要時發生錯誤：{e}\n請稍後再試一次 `/end`。"
+        )
+
 async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    結束指令第一階段：生成摘要並讓使用者預覽/修改
+    結束指令第一階段：啟動背景任務生成摘要
     """
     chat_id = update.message.chat_id
     state = get_conv_state(chat_id)
@@ -136,26 +176,12 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("目前沒有進行中的會談。")
         return
 
-    await update.message.reply_text("正在為您總結對話，請稍候...")
+    await update.message.reply_text("好的，正在為您總結對話。內容生成需要一些時間，完成後會發送給您。")
 
-    page_id = state["page_id"]
-    title = state["customer_title"]
     history = state["history"]
-    gcp: GcpService = context.application.bot_data["gcp"]
-    client = gcp.genai_client
-    summary_text = await summarize_conversation(client, title, history)
-
-    state["pending_summary"] = summary_text
-    state["awaiting_save"] = True 
-    set_conv_state(chat_id, state)
-
-    # 3. 回傳給使用者預覽
-    await update.message.reply_text(
-        f"【討論摘要初稿】\n\n{summary_text}\n\n"
-        "-----------------------------\n"
-        "請確認以上內容：\n"
-        "若需 **修改**，請直接發送新的摘要內容。\n"
-        "若 **確認無誤**，請輸入 `/save` 將其寫入 Notion 並結束會談。"
+    title = state["customer_title"]
+    asyncio.create_task(
+        _summarize_task(chat_id=chat_id, context=context, history=history, title=title)
     )
 
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -174,6 +200,16 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     title = state["customer_title"]
 
     await update.message.reply_text("正在寫入 Notion...")
+
+    # 根據聊天室類型決定摘要標題的來源名稱
+    chat = update.message.chat
+    if chat.type == 'private':
+        source_name = chat.full_name
+    else:  # 'group' or 'supergroup'
+        source_name = chat.title
+    
+    summary_title = f"與 {source_name} 的討論摘要"
+
     char_limit = 2000
     summary_chunks = [summary_text[i:i+char_limit] for i in range(0, len(summary_text), char_limit)]
 
@@ -182,7 +218,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "object": "block",
             "type": "heading_2",
             "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": f"與 {update.message.from_user.full_name} 的討論摘要"}}]
+                "rich_text": [{"type": "text", "text": {"content": summary_title}}]
             }
         }
     ]
