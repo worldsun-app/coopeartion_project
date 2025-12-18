@@ -11,9 +11,6 @@ from generate import answer_question, summarize_conversation, answer_with_ground
 # 串接 Redis 客戶端
 from redis_client import get_conv_state, set_conv_state, delete_conv_state
 
-# 將 CONV 全域變數註解掉，改用 Redis 進行狀態管理
-# CONV: Dict[int, Dict[str, Any]] = {}
-
 def inject_services(app: Application, notion: NotionService, gcp_service: GcpService):
     """把外部服務放到 application.bot_data"""
     app.bot_data["notion"] = notion
@@ -62,7 +59,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     client = gcp.genai_client
     
     try:
-        hits = notion.find_customer_pages_by_title(customer_name)
+        hits = await asyncio.to_thread(notion.find_customer_pages_by_title, customer_name)
     except Exception as e:
         await update.message.reply_text(f"從 Notion 查詢資料時發生錯誤：{e}")
         return
@@ -79,7 +76,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     page = hits[0]
     page_id = page["id"]
     title = page.get("_title") or "未命名"
-    portrait = notion.get_page_portrait_section(page_id)
+    portrait = await asyncio.to_thread(notion.get_page_portrait_section, page_id)
 
     # --- 修改：建立新的會談狀態並存入 Redis ---
     new_state = {
@@ -240,7 +237,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         notion: NotionService = context.application.bot_data["notion"]
-        notion.append_blocks_to_page(page_id, blocks_to_append)
+        await asyncio.to_thread(notion.append_blocks_to_page, page_id, blocks_to_append)
         await update.message.reply_text(f"✅ 已將本次討論摘要寫入 Notion 頁面：【{title}】\n會談已正式結束。")
 
         delete_conv_state(chat_id)
@@ -395,7 +392,8 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("正在參考討論內容，到公司產品資料庫搜尋，請稍候...")
     
     gcp_service: GcpService = context.application.bot_data["gcp"]
-    answer = gcp_service.query_knowledge_base(
+    answer = await asyncio.to_thread(
+        gcp_service.query_knowledge_base,
         user_question=user_query,
         product_filter=matching_term,
         search_query=final_query, 
@@ -454,7 +452,8 @@ async def direct_database_command(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("正在嘗試直接搜尋您的原文...")
 
     gcp_service: GcpService = context.application.bot_data["gcp"]
-    answer = gcp_service.query_knowledge_base(
+    answer = await asyncio.to_thread(
+        gcp_service.query_knowledge_base,
         user_question=user_query,
         product_filter=product_filter,
         search_query=final_query,

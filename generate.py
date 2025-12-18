@@ -1,10 +1,9 @@
 import os
+import asyncio
 from typing import Dict, List
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-
-# load_dotenv() # 移除全域載入，由 main.py 或其他地方控制，或者保留也無妨，但 client 不再這裡 init
 
 def _build_user_prompt(title: str, portrait: str, question: str, history: List[Dict[str, str]] | None = None) -> str:
     """建立用於問答的提示"""
@@ -52,7 +51,8 @@ async def answer_question(client: genai.Client, title: str, portrait: str, quest
     """
     prompt = _build_user_prompt(title, portrait, question, history)
     try:
-        response = client.models.generate_content(
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model="gemini-2.5-flash",
             contents=prompt,
         )
@@ -90,7 +90,8 @@ async def summarize_conversation(client: genai.Client, title: str, history: List
     )
 
     try:
-        response = client.models.generate_content(
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model="gemini-2.5-flash",
             contents=prompt,
         )
@@ -117,7 +118,8 @@ async def refine_summary(client: genai.Client, current_summary: str, instruction
     )
 
     try:
-        response = client.models.generate_content(
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model="gemini-2.5-flash",
             contents=prompt,
         )
@@ -154,7 +156,8 @@ async def summarize_segment(client: genai.Client, segment: List[Dict[str, str]])
     )
 
     try:
-        response = client.models.generate_content(
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model="gemini-2.5-flash",
             contents=prompt,
         )
@@ -171,7 +174,8 @@ async def answer_with_grounding(client: genai.Client, question: str):
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         config = types.GenerateContentConfig(tools=[grounding_tool])
         
-        response = client.models.generate_content(
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model="gemini-2.5-flash",
             contents=question,
             config=config 
@@ -194,7 +198,8 @@ async def extract_product_from_query(client: genai.Client, query: str) -> str:
         f"公司名稱或公司產品名："
     )
     try:
-        response = client.models.generate_content(
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model="gemini-2.5-flash",
             contents=prompt,
         )
@@ -220,7 +225,8 @@ async def extract_keywords_from_query(client: genai.Client, query: str) -> List[
         f"關鍵字列表："
     )
     try:
-        response = client.models.generate_content(
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model="gemini-2.5-flash",
             contents=prompt,
         )
